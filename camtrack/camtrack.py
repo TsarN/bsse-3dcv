@@ -84,8 +84,8 @@ class CamTrack:
             
             if frames == self.initial_frames:
                 params = TriangulationParameters(
-                        max_reprojection_error=params.max_reprojection_error * 1.1,
-                        min_triangulation_angle_deg=params.min_triangulation_angle_deg / 1.1,
+                        max_reprojection_error=params.max_reprojection_error * 1.02,
+                        min_triangulation_angle_deg=params.min_triangulation_angle_deg / 1.02,
                         min_depth=params.min_depth)
             else:
                 break
@@ -114,8 +114,8 @@ class CamTrack:
 
         if not final:
             p = self.triangulation_parameters.max_reprojection_error
-            while len(inliers) < 7 and p < 100:
-                p *= 1.1
+            while len(inliers) < 5 and p < 100:
+                p *= 1.02
                 inliers = calc_inlier_indices(points, corners, np.matmul(self.intrinsic_mat, self.view_mats[frame]), p)
             outlier_ids = np.setdiff1d(corners_ids, corners_ids[inliers])
             self.outliers[outlier_ids] = True
@@ -163,7 +163,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         point_cloud_builder,
         intrinsic_mat,
         view_mats,
-        TriangulationParameters(1.0, 1.25, 0.0)
+        TriangulationParameters(3.0, 1.25, 0.0)
     )
 
     cam_track.run()
