@@ -80,6 +80,9 @@ class CornerDetector:
 
         n = self.corner_szs.size
 
+        if n >= self.CORNERS:
+            return
+
         pts = []
         ids = []
         szs = []
