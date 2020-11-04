@@ -4,6 +4,7 @@ from collections import namedtuple
 import contextlib
 import os
 from os import path
+import traceback
 
 import click
 from good import Any, Default, Invalid, Optional, Schema
@@ -176,6 +177,7 @@ def _do_tracking(test_info, ground_truth, corner_storage, test_dir):
         )
     except Exception as err:  # pylint:disable=broad-except
         click.echo('  scene solving failed: {}'.format(err))
+        traceback.print_exc(err)
         return None, None
     else:
         click.echo('  scene solving succeeded')

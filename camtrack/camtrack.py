@@ -101,19 +101,27 @@ class CamTrack:
             corners = frame_corners.points[corners_idx[inliers_idx]]
             corners_ids = frame_corners.ids[corners_idx[inliers_idx]]
             points = self.point_cloud_builder.points[points_idx[inliers_idx]]
-            if points.shape[0] >= 4:
+            if points.shape[0] >= 6:
                 break
         else:
-            raise RuntimeError(f"cv2.solvePnPRansac: not enough points ({points.shape[0]}) on frame {frame}")
-        retval, rvec, tvec, inliers = cv2.solvePnPRansac(points, corners, self.intrinsic_mat, None, flags=cv2.SOLVEPNP_EPNP)
+            raise RuntimeError(f"PnP solver: not enough points ({points.shape[0]}) on frame {frame}")
 
-        if not retval:
-            raise RuntimeError(f"cv2.solvePnPRansac failed on frame {frame}")
+        p = 4.0
+
+        if final:
+            retval, rvec, tvec = cv2.solvePnP(points, corners, self.intrinsic_mat, None, flags=cv2.SOLVEPNP_ITERATIVE)
+
+            if not retval:
+                raise RuntimeError(f"cv2.solvePnP failed on frame {frame}")
+        else:
+            retval, rvec, tvec, inliers = cv2.solvePnPRansac(points, corners, self.intrinsic_mat, None, flags=cv2.SOLVEPNP_EPNP, reprojectionError=p)
+
+            if not retval:
+                raise RuntimeError(f"cv2.solvePnPRansac failed on frame {frame}")
 
         self.view_mats[frame] = rodrigues_and_translation_to_view_mat3x4(rvec, tvec)
 
         if not final:
-            p = self.triangulation_parameters.max_reprojection_error
             while len(inliers) < 5 and p < 100:
                 p *= 1.02
                 inliers = calc_inlier_indices(points, corners, np.matmul(self.intrinsic_mat, self.view_mats[frame]), p)
@@ -127,7 +135,7 @@ class CamTrack:
                 continue
             self.track2((prev, frame))
             cnt += 1
-            if cnt < 5:
+            if cnt >= 5:
                 break
 
     def run(self):
@@ -163,7 +171,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         point_cloud_builder,
         intrinsic_mat,
         view_mats,
-        TriangulationParameters(3.0, 1.25, 0.0)
+        TriangulationParameters(1.5, 1.25, 0.0)
     )
 
     cam_track.run()
