@@ -164,7 +164,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     corners_0 = corner_storage[0]
     point_cloud_builder = PointCloudBuilder(corners_0.ids[:1],
                                             np.zeros((1, 3)))
-
     cam_track = CamTrack(
         corner_storage,
         (known_view_1, known_view_2),
