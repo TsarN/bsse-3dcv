@@ -4,7 +4,6 @@ from collections import namedtuple
 import contextlib
 import os
 from os import path
-import traceback
 
 import click
 from good import Any, Default, Invalid, Optional, Schema
@@ -56,10 +55,13 @@ def read_config(config_path):
     config_data = DATASET_CONFIG_SCHEMA(raw_config_data)
     config = dict()
     for name, info in config_data['tests'].items():
-        config[name] = TestInfo(**{
+        info = {
             k: path.join(root, v) if isinstance(v, str) else v
             for k, v in info.items()
-        })
+        }
+        if "initial_frames" not in info:
+            info["initial_frames"] = None
+        config[name] = TestInfo(**info)
     return config
 
 
@@ -177,7 +179,6 @@ def _do_tracking(test_info, ground_truth, corner_storage, test_dir):
         )
     except Exception as err:  # pylint:disable=broad-except
         click.echo('  scene solving failed: {}'.format(err))
-        traceback.print_exc(err)
         return None, None
     else:
         click.echo('  scene solving succeeded')

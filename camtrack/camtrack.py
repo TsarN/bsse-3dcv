@@ -23,7 +23,6 @@ class CamTrack:
     known_views              = attr.ib()
     point_cloud_builder      = attr.ib()
     intrinsic_mat            = attr.ib()
-    view_mats                = attr.ib()
     triangulation_parameters = attr.ib()
 
     @property
@@ -35,6 +34,8 @@ class CamTrack:
         return [self.known_views[i][0] for i in range(2)]
 
     def track_order(self):
+        self.init_known_views()
+
         fst, snd = sorted(self.initial_frames)
 
         self.start(1)
@@ -61,6 +62,7 @@ class CamTrack:
     def start(self, direction):
         self.direction = direction
         self.steps = 0
+        self.view_mats = [pose_to_view_mat3x4(self.known_views[0][1])] * self.frame_count
         self.view_mats[self.initial_frames[1]] = pose_to_view_mat3x4(self.known_views[1][1])
         initial_view_mats = [self.view_mats[self.initial_frames[i]] for i in range(2)]
         camera_centers = [to_camera_center(initial_view_mats[i]) for i in range(2)]
@@ -138,6 +140,75 @@ class CamTrack:
             if cnt >= 5:
                 break
 
+    def try_init_known_views(self, frames):
+        frame_corners = [self.corner_storage[frames[i]] for i in range(2)]
+        correspondences = build_correspondences(*frame_corners)
+
+        essential_mat, mask = cv2.findEssentialMat(correspondences.points_1,
+                correspondences.points_2, self.intrinsic_mat)
+
+        correspondences = Correspondences(*[
+            getattr(correspondences, i)[mask.flatten().astype(bool)]
+        for i in ("ids", "points_1", "points_2")])
+
+        homography_mat, mask = cv2.findHomography(correspondences.points_1, correspondences.points_2, cv2.RANSAC)
+        inliers = np.count_nonzero(mask)
+        inliers_frac = inliers / correspondences.ids.size
+
+        if inliers_frac > .6:
+            return -1, None
+
+        r1, r2, t = cv2.decomposeEssentialMat(essential_mat)
+        possible_solutions = [
+            np.hstack((r1, t)),
+            np.hstack((r1, -t)),
+            np.hstack((r2, t)),
+            np.hstack((r2, -t))
+        ]
+
+        for solution in possible_solutions:
+            points, point_ids, _ = triangulate_correspondences(
+                    correspondences, eye3x4(),
+                    solution, self.intrinsic_mat,
+                    self.triangulation_parameters)
+            if point_ids.size >= 50:
+                return point_ids.size, view_mat3x4_to_pose(solution)
+
+        return -1, None
+
+    def init_known_views(self):
+        if self.known_views[0] is not None and self.known_views[1] is not None:
+            return
+
+        max_rating = -1
+        max_pose = None
+        max_idx = None
+
+        pairs = []
+        for i in range(self.frame_count):
+            for j in range(i + 1, self.frame_count):
+                pair = i, j
+                common = np.intersect1d(self.corner_storage[i].ids, self.corner_storage[j].ids).size
+                if common < 500:
+                    break
+                rating, pose = self.try_init_known_views(pair)
+
+                if rating > max_rating:
+                    max_rating = rating
+                    max_pose = pose
+                    max_idx = pair
+        
+        if max_pose is None:
+            raise RuntimeError("Failed to initialize known views")
+        
+        self.known_views = [
+            (max_idx[0], view_mat3x4_to_pose(eye3x4())),
+            (max_idx[1], max_pose)
+        ]
+
+        print(f"Initialized known views; {self.known_views[0][0]} and {self.known_views[1][0]}")
+        print(f"Total frames: {self.frame_count}")
+
     def run(self):
         with click.progressbar(self.track_order(), label="Tracking camera") as bar:
             for frame in bar:
@@ -150,8 +221,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
                           known_view_1: Optional[Tuple[int, Pose]] = None,
                           known_view_2: Optional[Tuple[int, Pose]] = None) \
         -> Tuple[List[Pose], PointCloud]:
-    if known_view_1 is None or known_view_2 is None:
-        raise NotImplementedError()
 
     rgb_sequence = frameseq.read_rgb_f32(frame_sequence_path)
     intrinsic_mat = to_opencv_camera_mat3x3(
@@ -159,8 +228,6 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         rgb_sequence[0].shape[0]
     )
 
-    frame_count = len(corner_storage)
-    view_mats = [pose_to_view_mat3x4(known_view_1[1])] * frame_count
     corners_0 = corner_storage[0]
     point_cloud_builder = PointCloudBuilder(corners_0.ids[:1],
                                             np.zeros((1, 3)))
@@ -169,8 +236,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         (known_view_1, known_view_2),
         point_cloud_builder,
         intrinsic_mat,
-        view_mats,
-        TriangulationParameters(1.5, 1.25, 0.0)
+        TriangulationParameters(7.0, 1.25, 0.0)
     )
 
     cam_track.run()
@@ -178,13 +244,13 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
     calc_point_cloud_colors(
         point_cloud_builder,
         rgb_sequence,
-        view_mats,
+        cam_track.view_mats,
         intrinsic_mat,
         corner_storage,
         5.0
     )
     point_cloud = point_cloud_builder.build_point_cloud()
-    poses = list(map(view_mat3x4_to_pose, view_mats))
+    poses = list(map(view_mat3x4_to_pose, cam_track.view_mats))
     return poses, point_cloud
 
 
