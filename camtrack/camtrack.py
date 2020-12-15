@@ -33,26 +33,48 @@ class CamTrack:
     def initial_frames(self):
         return [self.known_views[i][0] for i in range(2)]
 
-    def track_order(self):
+    def run(self):
+        self.known_views = list(self.known_views)
         self.init_known_views()
+
+        self.view_mats = [pose_to_view_mat3x4(self.known_views[0][1])] * self.frame_count
+        self.view_mats[self.initial_frames[1]] = pose_to_view_mat3x4(self.known_views[1][1])
+        self.inlier_counts = [-1] * self.frame_count
+        initial_view_mats = [self.view_mats[self.initial_frames[i]] for i in range(2)]
+        camera_centers = [to_camera_center(initial_view_mats[i]) for i in range(2)]
+        self.initial_distance = np.linalg.norm(camera_centers[0] - camera_centers[1])
+        self.solved_frames = np.zeros(self.frame_count).astype(bool)
+        self.solved_frames[self.initial_frames[0]] = True
+        self.solved_frames[self.initial_frames[1]] = True
+
+        self.track2(self.initial_frames)
 
         fst, snd = sorted(self.initial_frames)
 
-        self.start(1)
+        while not self.solved_frames.all():
+            self.start(1)
 
-        for i in range(fst + 1, snd):
-            self.steps += 1
-            yield i
+            for i in range(self.frame_count):
+                self.track_catch(i)
 
-        for i in range(snd + 1, self.frame_count):
-            self.steps += 1
-            yield i
+            self.start(-1)
 
-        self.start(-1)
+            for i in reversed(range(self.frame_count)):
+                self.track_catch(i)
 
-        for i in reversed(range(fst)):
-            self.steps += 1
-            yield i
+    def track_catch(self, frame, skip=False):
+        self.steps += 1
+        if frame in self.initial_frames:
+            return
+        try:
+            self.track(frame)
+        except:
+            return
+        self.solved_frames[frame] = True
+        print(f"Solved frame #{frame} (solved {np.count_nonzero(self.solved_frames)} out of {self.frame_count})")
+        if not skip and np.count_nonzero(self.solved_frames) % 5 == 0:
+            for i in range(self.frame_count):
+                self.track_catch(i, True)
 
     def track_prev(self, frame):
         for _ in range(self.steps):
@@ -62,15 +84,6 @@ class CamTrack:
     def start(self, direction):
         self.direction = direction
         self.steps = 0
-        self.view_mats = [pose_to_view_mat3x4(self.known_views[0][1])] * self.frame_count
-        self.view_mats[self.initial_frames[1]] = pose_to_view_mat3x4(self.known_views[1][1])
-        initial_view_mats = [self.view_mats[self.initial_frames[i]] for i in range(2)]
-        camera_centers = [to_camera_center(initial_view_mats[i]) for i in range(2)]
-        self.initial_distance = np.linalg.norm(camera_centers[0] - camera_centers[1])
-        self.outliers = np.zeros(max([i.ids.size for i in self.corner_storage]) + 1, dtype=bool)
-
-        if direction == 1:
-            self.track2(self.initial_frames)
 
     def track2(self, frames):
         frame_corners = [self.corner_storage[frames[i]] for i in range(2)]
@@ -93,43 +106,39 @@ class CamTrack:
                 break
         self.point_cloud_builder.add_points(point_ids, points)
 
-    def track(self, frame, final=False):
+    def track(self, frame):
         frame_corners = self.corner_storage[frame]
         intersect, corners_idx, points_idx = np.intersect1d(frame_corners.ids, self.point_cloud_builder.ids, return_indices=True)
 
-        for mask in [self.outliers, np.zeros_like(self.outliers)]:
-            ids = np.where(np.invert(mask))
-            inliers_idx = np.intersect1d(ids, intersect, return_indices=True)[2]
-            corners = frame_corners.points[corners_idx[inliers_idx]]
-            corners_ids = frame_corners.ids[corners_idx[inliers_idx]]
-            points = self.point_cloud_builder.points[points_idx[inliers_idx]]
-            if points.shape[0] >= 6:
-                break
-        else:
+        corners = frame_corners.points[corners_idx]
+        corners_ids = frame_corners.ids[corners_idx]
+        points = self.point_cloud_builder.points[points_idx]
+
+        if points.shape[0] < 6:
             raise RuntimeError(f"PnP solver: not enough points ({points.shape[0]}) on frame {frame}")
 
-        p = 4.0
+        retval, rvec, tvec, inliers = cv2.solvePnPRansac(points, corners,
+                self.intrinsic_mat, None, flags=cv2.SOLVEPNP_EPNP,
+                reprojectionError=2.0)
 
-        if final:
-            retval, rvec, tvec = cv2.solvePnP(points, corners, self.intrinsic_mat, None, flags=cv2.SOLVEPNP_ITERATIVE)
-
-            if not retval:
-                raise RuntimeError(f"cv2.solvePnP failed on frame {frame}")
+        if not retval:
+            raise RuntimeError(f"cv2.solvePnPRansac failed on frame {frame}")
+        
+        inliers = np.array(inliers).flatten()
+        if inliers.size > self.inlier_counts[frame]:
+            self.inlier_counts[frame] = inliers.size
         else:
-            retval, rvec, tvec, inliers = cv2.solvePnPRansac(points, corners, self.intrinsic_mat, None, flags=cv2.SOLVEPNP_EPNP, reprojectionError=p)
+            return
+        corners = corners[inliers]
+        points = points[inliers]
 
-            if not retval:
-                raise RuntimeError(f"cv2.solvePnPRansac failed on frame {frame}")
+        retval, rvec, tvec = cv2.solvePnP(points, corners,
+                self.intrinsic_mat, None, flags=cv2.SOLVEPNP_ITERATIVE)
+
+        if not retval:
+            raise RuntimeError(f"cv2.solvePnP failed on frame {frame}")
 
         self.view_mats[frame] = rodrigues_and_translation_to_view_mat3x4(rvec, tvec)
-
-        if not final:
-            while len(inliers) < 5 and p < 100:
-                p *= 1.02
-                inliers = calc_inlier_indices(points, corners, np.matmul(self.intrinsic_mat, self.view_mats[frame]), p)
-            outlier_ids = np.setdiff1d(corners_ids, corners_ids[inliers])
-            self.outliers[outlier_ids] = True
-            self.track(frame, final=True)
 
         cnt = 0
         for prev in self.track_prev(frame):
@@ -140,23 +149,38 @@ class CamTrack:
             if cnt >= 5:
                 break
 
-    def try_init_known_views(self, frames):
+    def try_init_known_views(self, frames, common_thr):
         frame_corners = [self.corner_storage[frames[i]] for i in range(2)]
+        common = len(np.intersect1d(frame_corners[0].ids, frame_corners[1].ids))
+        if common < common_thr:
+            return
         correspondences = build_correspondences(*frame_corners)
 
-        essential_mat, mask = cv2.findEssentialMat(correspondences.points_1,
-                correspondences.points_2, self.intrinsic_mat)
+        essential_mat, mask = cv2.findEssentialMat(
+                correspondences.points_1,
+                correspondences.points_2,
+                self.intrinsic_mat)
+        
+        if essential_mat is None:
+            return
 
         correspondences = Correspondences(*[
             getattr(correspondences, i)[mask.flatten().astype(bool)]
         for i in ("ids", "points_1", "points_2")])
 
-        homography_mat, mask = cv2.findHomography(correspondences.points_1, correspondences.points_2, cv2.RANSAC)
+        homography_mat, mask = cv2.findHomography(
+                correspondences.points_1, correspondences.points_2, 
+                method=cv2.RANSAC,
+                ransacReprojThreshold=1.0,
+                confidence=.999)
+        if homography_mat is None:
+            return
+
         inliers = np.count_nonzero(mask)
         inliers_frac = inliers / correspondences.ids.size
 
         if inliers_frac > .6:
-            return -1, None
+            return
 
         r1, r2, t = cv2.decomposeEssentialMat(essential_mat)
         possible_solutions = [
@@ -166,53 +190,42 @@ class CamTrack:
             np.hstack((r2, -t))
         ]
 
+        result = None
+
         for solution in possible_solutions:
             points, point_ids, _ = triangulate_correspondences(
                     correspondences, eye3x4(),
                     solution, self.intrinsic_mat,
                     self.triangulation_parameters)
-            if point_ids.size >= 50:
-                return point_ids.size, view_mat3x4_to_pose(solution)
-
-        return -1, None
+            if point_ids.size >= self.best_init_rating:
+                self.best_init_rating = point_ids.size
+                self.known_views[0] = frames[0], view_mat3x4_to_pose(eye3x4())
+                self.known_views[1] = frames[1], view_mat3x4_to_pose(solution)
 
     def init_known_views(self):
         if self.known_views[0] is not None and self.known_views[1] is not None:
             return
 
-        max_rating = -1
-        max_pose = None
-        max_idx = None
-
         pairs = []
         for i in range(self.frame_count):
-            for j in range(i + 1, self.frame_count):
-                pair = i, j
-                common = np.intersect1d(self.corner_storage[i].ids, self.corner_storage[j].ids).size
-                if common < 500:
+            for j in range(i + 5, min(i + 60, self.frame_count)):
+                pairs.append((i, j))
+
+        np.random.seed(2183798173)
+        np.random.shuffle(pairs)
+        self.best_init_rating = -1
+
+        common_thr = 1000
+
+        while self.best_init_rating == -1:
+            for i, pair in enumerate(pairs):
+                if self.best_init_rating != -1 and i >= 100:
                     break
-                rating, pose = self.try_init_known_views(pair)
+                self.try_init_known_views(pair, common_thr)
+                print(f"attempt {i}, best = {self.best_init_rating}, frames = {pair}, common_thr = {common_thr}")
+            common_thr *= .9
 
-                if rating > max_rating:
-                    max_rating = rating
-                    max_pose = pose
-                    max_idx = pair
-        
-        if max_pose is None:
-            raise RuntimeError("Failed to initialize known views")
-        
-        self.known_views = [
-            (max_idx[0], view_mat3x4_to_pose(eye3x4())),
-            (max_idx[1], max_pose)
-        ]
-
-        print(f"Initialized known views; {self.known_views[0][0]} and {self.known_views[1][0]}")
-        print(f"Total frames: {self.frame_count}")
-
-    def run(self):
-        with click.progressbar(self.track_order(), label="Tracking camera") as bar:
-            for frame in bar:
-                self.track(frame)
+        print(f"initial_frames = {self.initial_frames}")
 
 
 def track_and_calc_colors(camera_parameters: CameraParameters,
@@ -236,7 +249,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         (known_view_1, known_view_2),
         point_cloud_builder,
         intrinsic_mat,
-        TriangulationParameters(7.0, 1.25, 0.0)
+        TriangulationParameters(3.0, 1.1, 1e-4)
     )
 
     cam_track.run()

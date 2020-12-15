@@ -34,16 +34,14 @@ class _CornerStorageBuilder:
 
 
 class CornerDetector:
-    PYR_WIN = (15, 15) # window size when building pyramids
-    PYR_LVL = 4        # maximum number of pyramid levels
-    CORNERS = 10000    # maximum number of corners to track
-    MIN_DIST = 10      # minimum distance between corners
-    BLK_SIZE = 3       # block size when tracking features
-
-    def __init__(self):
+    def __init__(self, width, height):
         self.pyr = None
         self.levels = None
         self.last_id = 0
+        self.min_dist = 10
+        self.blk_size = 7
+        self.win_size = (10, 10)
+        self.corners = 10000
 
         self.corner_pts = np.ndarray((0, 2), dtype=np.float32)
         self.corner_ids = np.array([], dtype=np.int32)
@@ -64,7 +62,7 @@ class CornerDetector:
         return FrameCorners(self.corner_ids, self.corner_pts, self.corner_szs)
 
     def _pyr(self, im):
-        levels, pyr = cv2.buildOpticalFlowPyramid(im, self.PYR_WIN, self.PYR_LVL, None, False)
+        levels, pyr = cv2.buildOpticalFlowPyramid(im, self.win_size, 3, None, False)
 
         if self.levels is None:
             self.levels = levels
@@ -80,7 +78,7 @@ class CornerDetector:
 
         n = self.corner_szs.size
 
-        if n >= self.CORNERS:
+        if n >= self.corners:
             return
 
         pts = []
@@ -92,11 +90,11 @@ class CornerDetector:
                 mask = cv2.pyrDown(mask).astype(np.uint8)
 
             feat = cv2.goodFeaturesToTrack(pyr[i],
-                    maxCorners=self.CORNERS - n,
-                    qualityLevel=0.05,
-                    minDistance=self.MIN_DIST,
+                    maxCorners=self.corners - n,
+                    qualityLevel=0.06,
+                    minDistance=self.min_dist,
                     mask=mask,
-                    blockSize=self.BLK_SIZE)
+                    blockSize=self.blk_size)
 
             if feat is None: # why does this happen???
                 continue
@@ -109,34 +107,28 @@ class CornerDetector:
 
                 pts.append((x * factor, y * factor))
                 ids.append(self.last_id)
-                szs.append(self.BLK_SIZE * factor)
+                szs.append(self.blk_size * factor)
                 self.last_id += 1
 
-                mask = cv2.circle(mask, (np.int(x), np.int(y)), self.BLK_SIZE, 0, -1)
+                mask = cv2.circle(mask, (np.int(x), np.int(y)), self.blk_size, 0, -1)
 
-        self.corner_pts = np.concatenate((self.corner_pts, pts))
-        self.corner_ids = np.concatenate((self.corner_ids, ids))
-        self.corner_szs = np.concatenate((self.corner_szs, szs))
+        if pts:
+            self.corner_pts = np.concatenate((self.corner_pts, pts))
+            self.corner_ids = np.concatenate((self.corner_ids, ids))
+            self.corner_szs = np.concatenate((self.corner_szs, szs))
 
     def _track(self, pyr0, pyr1):
         if self.corner_pts.size == 0:
             return
 
         pts0 = self.corner_pts
-        pts1 = None
+        pts1, status, err = cv2.calcOpticalFlowPyrLK(
+            pyr0[0], pyr1[0], np.asarray(pts0, dtype=np.float32), None,
+            winSize=self.win_size,
+            minEigThreshold=1e-3
+        )
 
-        flags = 0
-
-        for i in reversed(range(self.levels)):
-            if i != self.levels - 1:
-                pts1 *= 2
-                flags |= cv2.OPTFLOW_USE_INITIAL_FLOW
-
-            pts1, status, err = cv2.calcOpticalFlowPyrLK(
-                    pyr0[i], pyr1[i], (pts0 / 2 ** i).astype(np.float32), pts1,
-                    flags=flags, winSize=self.PYR_WIN)
-
-        tracked = status.reshape((-1,)) == 1
+        tracked = status.flatten() == 1
         self.corner_pts = pts1[tracked]
         self.corner_ids = self.corner_ids[tracked]
         self.corner_szs = self.corner_szs[tracked]
@@ -144,7 +136,7 @@ class CornerDetector:
 
 def _build_impl(frame_sequence: pims.FramesSequence,
                 builder: _CornerStorageBuilder) -> None:
-    detector = CornerDetector()
+    detector = CornerDetector(*frame_sequence.frame_shape[:2])
 
     for frame, image in enumerate(frame_sequence):
         builder.set_corners_at_frame(frame, detector.next_frame(image))
