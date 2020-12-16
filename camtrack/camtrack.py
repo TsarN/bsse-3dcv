@@ -16,6 +16,7 @@ from data3d import CameraParameters, PointCloud, Pose
 import frameseq
 from _camtrack import *
 
+REPROJ_ERR = 2.0
 
 @attr.s
 class CamTrack:
@@ -23,7 +24,6 @@ class CamTrack:
     known_views              = attr.ib()
     point_cloud_builder      = attr.ib()
     intrinsic_mat            = attr.ib()
-    triangulation_parameters = attr.ib()
 
     @property
     def frame_count(self):
@@ -47,27 +47,32 @@ class CamTrack:
         self.solved_frames[self.initial_frames[0]] = True
         self.solved_frames[self.initial_frames[1]] = True
 
-        self.track2(self.initial_frames)
+        self.triangulate_initial()
 
         fst, snd = sorted(self.initial_frames)
 
-        while not self.solved_frames.all():
-            self.start(1)
+        last = -1
+        while last != np.count_nonzero(self.solved_frames):
+            last = np.count_nonzero(self.solved_frames)
 
             for i in range(self.frame_count):
                 self.track_catch(i)
 
-            self.start(-1)
-
             for i in reversed(range(self.frame_count)):
                 self.track_catch(i)
 
+        if last != self.frame_count:
+            raise RuntimeError("Couldn't solve for every frame")
+
     def track_catch(self, frame, skip=False):
-        self.steps += 1
         if frame in self.initial_frames:
             return
         try:
             self.track(frame)
+        except KeyboardInterrupt:
+            raise
+        except SyntaxError:
+            raise
         except:
             return
         self.solved_frames[frame] = True
@@ -76,35 +81,36 @@ class CamTrack:
             for i in range(self.frame_count):
                 self.track_catch(i, True)
 
-    def track_prev(self, frame):
-        for _ in range(self.steps):
-            frame -= self.direction
-            yield frame
+            for i in reversed(range(self.frame_count)):
+                self.track_catch(i, True)
 
-    def start(self, direction):
-        self.direction = direction
-        self.steps = 0
-
-    def track2(self, frames):
-        frame_corners = [self.corner_storage[frames[i]] for i in range(2)]
-        frame_view_mats = [self.view_mats[frames[i]] for i in range(2)]
+    def triangulate_initial(self):
+        frame_corners = [self.corner_storage[self.initial_frames[i]] for i in range(2)]
+        frame_view_mats = [self.view_mats[self.initial_frames[i]] for i in range(2)]
         correspondences = build_correspondences(*frame_corners, self.point_cloud_builder.ids)
 
         points = []
-        params = self.triangulation_parameters
+        params = TriangulationParameters(REPROJ_ERR, 1.0, 1e-3)
         
         while len(points) < 8:
             points, point_ids, _ = triangulate_correspondences(correspondences, *frame_view_mats,
                                                                self.intrinsic_mat, params)
             
-            if frames == self.initial_frames:
-                params = TriangulationParameters(
-                        max_reprojection_error=params.max_reprojection_error * 1.02,
-                        min_triangulation_angle_deg=params.min_triangulation_angle_deg / 1.02,
-                        min_depth=params.min_depth)
-            else:
-                break
+            params = TriangulationParameters(
+                    max_reprojection_error=params.max_reprojection_error * 1.02,
+                    min_triangulation_angle_deg=params.min_triangulation_angle_deg / 1.02,
+                    min_depth=params.min_depth)
         self.point_cloud_builder.add_points(point_ids, points)
+
+    def triangulate(self, frames):
+        frame_corners = [self.corner_storage[frames[i]] for i in range(2)]
+        frame_view_mats = [self.view_mats[frames[i]] for i in range(2)]
+        correspondences = build_correspondences(*frame_corners, self.point_cloud_builder.ids)
+        params = TriangulationParameters(REPROJ_ERR, 1.0, 1e-3)
+        points, point_ids, median_cos = triangulate_correspondences(correspondences, *frame_view_mats,
+                                                               self.intrinsic_mat, params)
+        if points.size:
+            self.point_cloud_builder.add_points(point_ids, points)
 
     def track(self, frame):
         frame_corners = self.corner_storage[frame]
@@ -119,7 +125,7 @@ class CamTrack:
 
         retval, rvec, tvec, inliers = cv2.solvePnPRansac(points, corners,
                 self.intrinsic_mat, None, flags=cv2.SOLVEPNP_EPNP,
-                reprojectionError=2.0)
+                reprojectionError=REPROJ_ERR)
 
         if not retval:
             raise RuntimeError(f"cv2.solvePnPRansac failed on frame {frame}")
@@ -141,13 +147,10 @@ class CamTrack:
         self.view_mats[frame] = rodrigues_and_translation_to_view_mat3x4(rvec, tvec)
 
         cnt = 0
-        for prev in self.track_prev(frame):
-            if not check_baseline(self.view_mats[prev], self.view_mats[frame], self.initial_distance * .15):
+        for prev in range(self.frame_count):
+            if not self.solved_frames[prev] or prev == frame:
                 continue
-            self.track2((prev, frame))
-            cnt += 1
-            if cnt >= 5:
-                break
+            self.triangulate((prev, frame))
 
     def try_init_known_views(self, frames, common_thr):
         frame_corners = [self.corner_storage[frames[i]] for i in range(2)]
@@ -196,7 +199,7 @@ class CamTrack:
             points, point_ids, _ = triangulate_correspondences(
                     correspondences, eye3x4(),
                     solution, self.intrinsic_mat,
-                    self.triangulation_parameters)
+                    TriangulationParameters(REPROJ_ERR, 1.0, 1e-4))
             if point_ids.size >= self.best_init_rating:
                 self.best_init_rating = point_ids.size
                 self.known_views[0] = frames[0], view_mat3x4_to_pose(eye3x4())
@@ -208,7 +211,7 @@ class CamTrack:
 
         pairs = []
         for i in range(self.frame_count):
-            for j in range(i + 5, min(i + 60, self.frame_count)):
+            for j in range(i + 10, min(i + 60, self.frame_count)):
                 pairs.append((i, j))
 
         np.random.seed(2183798173)
@@ -248,8 +251,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         corner_storage,
         (known_view_1, known_view_2),
         point_cloud_builder,
-        intrinsic_mat,
-        TriangulationParameters(3.0, 1.1, 1e-4)
+        intrinsic_mat
     )
 
     cam_track.run()
@@ -260,7 +262,7 @@ def track_and_calc_colors(camera_parameters: CameraParameters,
         cam_track.view_mats,
         intrinsic_mat,
         corner_storage,
-        5.0
+        REPROJ_ERR
     )
     point_cloud = point_cloud_builder.build_point_cloud()
     poses = list(map(view_mat3x4_to_pose, cam_track.view_mats))
